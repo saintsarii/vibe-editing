@@ -9,6 +9,11 @@ import shutil, subprocess, os, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+# Check the kit's own .venv (where its packages live), not whatever python3 launched us.
+_venv_py = ROOT / ".venv" / "bin" / "python"
+if _venv_py.exists() and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
+    os.execv(str(_venv_py), [str(_venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
 G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; X = "\033[0m"
 def mark(b): return f"{G}OK{X}" if b else f"{R}MISSING{X}"
 def has(c): return shutil.which(c) is not None

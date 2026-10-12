@@ -25,3 +25,7 @@ yt-dlp
 # CPU-friendly (int8). First run downloads the model (~150 MB for 'small'). This is what makes
 # the kit work with no API key at all.
 faster-whisper
+# PyAV 19 removed av.open(metadata_errors=...), which faster-whisper 1.2.x still passes
+# (TypeError on any file path). The kit's own transcribers decode via ffmpeg
+# (lib/_shared/audio_decode.py), but keep PyAV below 19 so direct faster-whisper use works.
+av>=11,<19

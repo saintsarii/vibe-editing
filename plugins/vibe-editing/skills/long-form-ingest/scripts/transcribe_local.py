@@ -15,19 +15,11 @@ Model size defaults to 'small' (good speed/quality on CPU). Override with --mode
 the VIBE_WHISPER_MODEL env var (e.g. 'large-v3' for max quality, slower on CPU).
 """
 from __future__ import annotations
-import argparse, json, os, subprocess, sys, tempfile
+import argparse, json, os, sys
 from pathlib import Path
 
-
-def _extract_segment(src: str, start: float, end: float) -> str:
-    """ffmpeg-extract [start,end] to a temp 16k mono wav; words then rebase to 0."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{start}", "-to", f"{end}", "-i", src,
-         "-ac", "1", "-ar", "16000", "-vn", tmp],
-        check=True, capture_output=True,
-    )
-    return tmp
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib" / "_shared"))
+from audio_decode import load_audio  # noqa: E402
 
 
 def main() -> int:
@@ -48,16 +40,16 @@ def main() -> int:
         sys.exit("faster-whisper not installed. Run: pip install faster-whisper  "
                  "(or set GROQ_API_KEY to use the cloud path).")
 
-    src, tmp = a.input, None
     seg = a.start is not None and a.end is not None
-    if seg:
-        src = _extract_segment(a.input, a.start, a.end)
+    # ffmpeg-decode (just [start,end] if given — word times then start at 0) instead of
+    # faster-whisper's PyAV decoder, which breaks across PyAV releases.
+    audio = load_audio(a.input, start=a.start if seg else None, end=a.end if seg else None)
 
     print(f"[transcribe_local] model={a.model} device={a.device} → transcribing"
           f"{' segment' if seg else ''}…", file=sys.stderr)
     model = WhisperModel(a.model, device=a.device, compute_type=a.compute_type)
     segments, info = model.transcribe(
-        src, word_timestamps=True, vad_filter=True,
+        audio, word_timestamps=True, vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 300},
     )
     words, texts = [], []
@@ -82,9 +74,6 @@ def main() -> int:
     }
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(out, indent=2))
-    if tmp:
-        try: os.unlink(tmp)
-        except OSError: pass
     print(f"[transcribe_local] {len(words)} words → {a.out}", file=sys.stderr)
     return 0
 

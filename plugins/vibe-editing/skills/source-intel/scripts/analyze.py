@@ -37,18 +37,46 @@ def probe_video(source):
     audio_stream = next((s for s in data["streams"] if s["codec_type"] == "audio"), None)
 
     duration = float(data["format"].get("duration", 0))
+    coded_w = int(video_stream["width"]) if video_stream else 0
+    coded_h = int(video_stream["height"]) if video_stream else 0
+    rotation = _stream_rotation_cw(video_stream) if video_stream else 0
+    # Phones store portrait video as landscape pixels + a rotation flag; report what viewers see.
+    disp_w, disp_h = (coded_h, coded_w) if rotation in (90, 270) else (coded_w, coded_h)
     result = {
         "source": source,
         "duration_s": round(duration, 1),
-        "resolution": f"{video_stream['width']}x{video_stream['height']}" if video_stream else "unknown",
-        "width": int(video_stream["width"]) if video_stream else 0,
-        "height": int(video_stream["height"]) if video_stream else 0,
+        "resolution": f"{disp_w}x{disp_h}" if video_stream else "unknown",
+        "width": disp_w,
+        "height": disp_h,
+        "coded_width": coded_w,
+        "coded_height": coded_h,
+        "rotation": rotation,
         "fps": eval_fps(video_stream.get("r_frame_rate", "30/1")) if video_stream else 30,
         "codec": video_stream.get("codec_name", "unknown") if video_stream else "unknown",
         "audio_channels": int(audio_stream.get("channels", 0)) if audio_stream else 0,
         "audio_codec": audio_stream.get("codec_name", "unknown") if audio_stream else "none",
     }
     return result
+
+
+def _stream_rotation_cw(stream):
+    """Clockwise degrees (0/90/180/270) needed to display the stream upright.
+
+    ffprobe reports a display-matrix rotation (counter-clockwise, e.g. -90 for iPhone
+    portrait) and/or a legacy `rotate` tag (clockwise, e.g. 90)."""
+    for sd in stream.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                return int(round(-float(sd["rotation"]))) % 360
+            except (TypeError, ValueError):
+                pass
+    tag = (stream.get("tags") or {}).get("rotate")
+    if tag is not None:
+        try:
+            return int(round(float(tag))) % 360
+        except (TypeError, ValueError):
+            pass
+    return 0
 
 
 def eval_fps(fps_str):
@@ -61,112 +89,162 @@ def eval_fps(fps_str):
         return 30.0
 
 
-def detect_faces(source, sample_interval=10, duration=0):
-    """Extract frames and detect faces using OpenCV's YuNet."""
+YUNET_NAMES = ("face_detection_yunet_2023mar.onnx", "yunet.onnx")
+
+
+def _kit_root():
+    """The vibe-editing plugin root (the folder holding .claude-plugin/)."""
+    r = os.environ.get("VIBE_PIPELINE_ROOT") or os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if r and os.path.isdir(os.path.join(r, ".claude-plugin")):
+        return r
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d != os.path.dirname(d):
+        if os.path.isdir(os.path.join(d, ".claude-plugin")):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+
+def _find_yunet_model(cv2):
+    """Locate a YuNet face model: env override, next to this script, the kit's bundled
+    horizontal-to-vertical/scripts/yunet.onnx, then cv2's data dir."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [os.environ.get("VIBE_YUNET_MODEL")]
+    candidates += [os.path.join(here, n) for n in YUNET_NAMES]
+    root = _kit_root()
+    if root:
+        candidates.append(os.path.join(root, "skills", "horizontal-to-vertical", "scripts", "yunet.onnx"))
+    data_dir = os.path.join(os.path.dirname(cv2.__file__), "data")
+    candidates += [os.path.join(data_dir, n) for n in YUNET_NAMES]
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
+def _open_upright(cv2, source, rotation):
+    """Open `source` and return (cap, rotate_fn) so rotate_fn(frame) is display-upright.
+
+    Auto-orientation is switched off where supported so we rotate exactly once, from the
+    ffprobe rotation; if the backend ignores that switch, rotate only when the decoded
+    frame is still in coded (sideways) orientation."""
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        return cap, None
+    rot_code = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(rotation)
+    if rot_code is None:
+        return cap, lambda f: f
+    prop = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+    manual = prop is not None and cap.set(prop, 0) and not cap.get(prop)
+    coded_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    coded_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    def rotate(frame):
+        if manual:
+            return cv2.rotate(frame, rot_code)
+        h, w = frame.shape[:2]
+        if rotation in (90, 270) and (w, h) == (max(coded_w, coded_h), min(coded_w, coded_h)) \
+                and coded_w > coded_h:
+            return cv2.rotate(frame, rot_code)  # backend left it sideways
+        return frame  # backend already applied orientation (180° can't be told apart)
+    return cap, rotate
+
+
+def _sample_faces(cv2, source, rotation, sample_interval, detect):
+    """Seek through `source` every `sample_interval` s, run detect(frame) -> [(x,y,w,h)]
+    on upright frames, and cluster. Frame size comes from the decoded (upright) frame."""
+    cap, rotate = _open_upright(cv2, source, rotation)
+    if rotate is None:
+        return {"error": f"cannot open {source}"}
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step_frames = max(1, int(sample_interval * fps))
+    all_faces = []
+    sample_count = 0
+    frame_w = frame_h = 0
+
+    for frame_idx in range(0, total_frames, step_frames):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = rotate(frame)
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = frame_w * frame_h
+
+        sample_count += 1
+        for box in detect(frame):
+            x, y, w, h = (float(v) for v in box[:4])
+            all_faces.append({
+                "time_s": round(frame_idx / fps, 1),
+                "cx": round((x + w / 2) / frame_w, 3),
+                "cy": round((y + h / 2) / frame_h, 3),
+                "size_pct": round((w * h) / frame_area, 4),
+                "w": int(w), "h": int(h),
+            })
+
+    cap.release()
+    result = _cluster_faces(all_faces, frame_w, frame_h, sample_count)
+    result["frame_size"] = f"{frame_w}x{frame_h}"
+    return result
+
+
+def detect_faces(source, sample_interval=10, duration=0, rotation=0):
+    """Sample frames (upright, honoring rotation metadata) and detect faces with YuNet."""
     try:
         import cv2
     except ImportError:
         return {"error": "opencv not installed — run: pip3 install opencv-python"}
 
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        return {"error": f"cannot open {source}"}
+    model_path = _find_yunet_model(cv2)
+    if model_path is None or not hasattr(cv2, "FaceDetectorYN"):
+        return _detect_faces_haar(source, sample_interval, duration, rotation)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_area = frame_w * frame_h
+    detector = None
 
-    model_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "face_detection_yunet_2023mar.onnx",
-    )
-    if not os.path.exists(model_path):
-        data_dir = os.path.join(os.path.dirname(cv2.__file__), "data")
-        alt_path = os.path.join(data_dir, "face_detection_yunet_2023mar.onnx")
-        if os.path.exists(alt_path):
-            model_path = alt_path
-        else:
-            cap.release()
-            return _detect_faces_haar(source, sample_interval, duration)
-
-    detector = cv2.FaceDetectorYN.create(model_path, "", (frame_w, frame_h), 0.7)
-
-    step_frames = int(sample_interval * fps)
-    all_faces = []
-    sample_count = 0
-
-    for frame_idx in range(0, total_frames, step_frames):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        sample_count += 1
+    def detect(frame):
+        nonlocal detector
+        h, w = frame.shape[:2]
+        if detector is None:
+            detector = cv2.FaceDetectorYN.create(model_path, "", (w, h), 0.7)
+        detector.setInputSize((w, h))
         _, faces = detector.detect(frame)
-        if faces is not None:
-            for f in faces:
-                x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
-                cx = (x + w / 2) / frame_w
-                cy = (y + h / 2) / frame_h
-                size_pct = (w * h) / frame_area
-                all_faces.append({
-                    "time_s": round(frame_idx / fps, 1),
-                    "cx": round(cx, 3),
-                    "cy": round(cy, 3),
-                    "size_pct": round(size_pct, 4),
-                    "w": w, "h": h,
-                })
+        return [] if faces is None else [tuple(f[:4]) for f in faces]
 
-    cap.release()
-    return _cluster_faces(all_faces, frame_w, frame_h, sample_count)
+    result = _sample_faces(cv2, source, rotation, sample_interval, detect)
+    if "error" not in result:
+        result["detector"] = "yunet"
+    return result
 
 
-def _detect_faces_haar(source, sample_interval, duration):
-    """Fallback face detection using Haar cascades."""
+def _detect_faces_haar(source, sample_interval, duration, rotation=0):
+    """Fallback face detection using Haar cascades — only if this OpenCV build has them
+    (opencv-python 5.x dropped CascadeClassifier). Never raises: returns an error dict."""
     try:
         import cv2
     except ImportError:
         return {"error": "opencv not installed"}
 
-    cap = cv2.VideoCapture(source)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_area = frame_w * frame_h
+    no_faces = {"count": 0, "detections": 0, "samples": 0, "detector": "none",
+                "error": "face detection unavailable — no YuNet model found and this OpenCV "
+                         "build has no Haar cascades; reframe will use defaults"}
+    cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if not hasattr(cv2, "CascadeClassifier") or not cascade_dir:
+        return no_faces
+    try:
+        cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, "haarcascade_frontalface_default.xml"))
+        if cascade.empty():
+            return no_faces
 
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
+        def detect(frame):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
 
-    step_frames = int(sample_interval * fps)
-    all_faces = []
-    sample_count = 0
-
-    for frame_idx in range(0, total_frames, step_frames):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        sample_count += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detected = cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
-        for (x, y, w, h) in detected:
-            cx = (x + w / 2) / frame_w
-            cy = (y + h / 2) / frame_h
-            size_pct = (w * h) / frame_area
-            all_faces.append({
-                "time_s": round(frame_idx / fps, 1),
-                "cx": round(cx, 3),
-                "cy": round(cy, 3),
-                "size_pct": round(size_pct, 4),
-                "w": w, "h": h,
-            })
-
-    cap.release()
-    return _cluster_faces(all_faces, frame_w, frame_h, sample_count)
+        result = _sample_faces(cv2, source, rotation, sample_interval, detect)
+    except Exception as e:  # noqa: BLE001 — a broken fallback must not kill the analysis
+        return {**no_faces, "error": f"Haar fallback failed: {e}"}
+    if "error" not in result:
+        result["detector"] = "haar"
+    return result
 
 
 def _cluster_faces(all_faces, frame_w, frame_h, sample_count):
@@ -419,6 +497,8 @@ def make_recommendations(probe, faces, scenes, audio):
     face_count = faces.get("count", 0)
     if face_count >= 2:
         recs["notes"].append(f"{face_count} speakers detected — use dual-color captions")
+    elif faces.get("error"):
+        recs["notes"].append(f"{faces['error']} — using default reframe zoom")
     elif face_count == 0:
         recs["notes"].append("No faces detected — b-roll or text content, skip reframe")
 
@@ -460,7 +540,9 @@ def main():
 
     print("  Probing video metadata...")
     probe = probe_video(args.source)
-    print(f"  → {probe['resolution']}, {probe['duration_s']}s, {probe['fps']}fps")
+    rot = f" (rotated {probe['rotation']}° from {probe['coded_width']}x{probe['coded_height']})" \
+        if probe.get("rotation") else ""
+    print(f"  → {probe['resolution']}{rot}, {probe['duration_s']}s, {probe['fps']}fps")
 
     faces = {}
     scenes = {}
@@ -468,7 +550,8 @@ def main():
 
     if not args.audio_only:
         print(f"  Detecting faces (sampling every {args.sample_interval}s)...")
-        faces = detect_faces(args.source, args.sample_interval, probe["duration_s"])
+        faces = detect_faces(args.source, args.sample_interval, probe["duration_s"],
+                             probe.get("rotation", 0))
         print(f"  → {faces.get('count', 0)} face(s) from {faces.get('detections', 0)} detections")
 
         print("  Detecting scene changes...")
@@ -489,6 +572,9 @@ def main():
         "source": args.source,
         "duration_s": probe["duration_s"],
         "resolution": probe["resolution"],
+        "width": probe["width"],
+        "height": probe["height"],
+        "rotation": probe.get("rotation", 0),
         "fps": probe["fps"],
         "codec": probe["codec"],
         "faces": faces,

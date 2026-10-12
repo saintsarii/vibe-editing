@@ -18,11 +18,15 @@ except ImportError:
     print("faster-whisper not installed. Run: pip install faster-whisper", file=sys.stderr)
     sys.exit(2)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib" / "_shared"))
+from audio_decode import load_audio  # noqa: E402
+
 
 def transcribe_full(video: Path, model_size: str, device: str, compute_type: str):
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    # Decode with ffmpeg, not faster-whisper's PyAV path (breaks across PyAV releases).
     segments, info = model.transcribe(
-        str(video),
+        load_audio(video),
         word_timestamps=True,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 300},
